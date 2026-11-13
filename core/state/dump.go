@@ -23,10 +23,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/trie"
 )
 
 // DumpConfig is a set of options to control what portions of the state will be
@@ -43,27 +40,31 @@ type DumpConfig struct {
 type DumpCollector interface {
 	// OnRoot is called with the state root
 	OnRoot(common.Hash)
+
 	// OnAccount is called once for each account in the trie
-	OnAccount(common.Address, DumpAccount)
+	OnAccount(*common.Address, DumpAccount)
 }
 
 // DumpAccount represents an account in the state.
 type DumpAccount struct {
-	Balance   string                 `json:"balance"`
-	Nonce     uint64                 `json:"nonce"`
-	Root      hexutil.Bytes          `json:"root"`
-	CodeHash  hexutil.Bytes          `json:"codeHash"`
-	Code      hexutil.Bytes          `json:"code,omitempty"`
-	Storage   map[common.Hash]string `json:"storage,omitempty"`
-	Address   *common.Address        `json:"address,omitempty"` // Address only present in iterative (line-by-line) mode
-	SecureKey hexutil.Bytes          `json:"key,omitempty"`     // If we don't have address, we can output the key
-
+	Balance     string                 `json:"balance"`
+	Nonce       uint64                 `json:"nonce"`
+	Root        hexutil.Bytes          `json:"root"`
+	CodeHash    hexutil.Bytes          `json:"codeHash"`
+	Code        hexutil.Bytes          `json:"code,omitempty"`
+	Storage     map[common.Hash]string `json:"storage,omitempty"`
+	Address     *common.Address        `json:"address,omitempty"` // Address only present in iterative (line-by-line) mode
+	AddressHash hexutil.Bytes          `json:"key,omitempty"`     // If we don't have address, we can output the key
 }
 
 // Dump represents the full dump in a collected format, as one large map.
 type Dump struct {
-	Root     string                         `json:"root"`
-	Accounts map[common.Address]DumpAccount `json:"accounts"`
+	Root     string                 `json:"root"`
+	Accounts map[string]DumpAccount `json:"accounts"`
+
+	// Next can be set to represent that this dump is only partial, and Next
+	// is where an iterator should be positioned in order to continue the dump.
+	Next hexutil.Bytes `json:"next,omitempty"` // nil if no more accounts
 }
 
 // OnRoot implements DumpCollector interface
@@ -72,25 +73,13 @@ func (d *Dump) OnRoot(root common.Hash) {
 }
 
 // OnAccount implements DumpCollector interface
-func (d *Dump) OnAccount(addr common.Address, account DumpAccount) {
-	d.Accounts[addr] = account
-}
-
-// IteratorDump is an implementation for iterating over data.
-type IteratorDump struct {
-	Root     string                         `json:"root"`
-	Accounts map[common.Address]DumpAccount `json:"accounts"`
-	Next     []byte                         `json:"next,omitempty"` // nil if no more accounts
-}
-
-// OnRoot implements DumpCollector interface
-func (d *IteratorDump) OnRoot(root common.Hash) {
-	d.Root = fmt.Sprintf("%x", root)
-}
-
-// OnAccount implements DumpCollector interface
-func (d *IteratorDump) OnAccount(addr common.Address, account DumpAccount) {
-	d.Accounts[addr] = account
+func (d *Dump) OnAccount(addr *common.Address, account DumpAccount) {
+	if addr == nil {
+		d.Accounts[fmt.Sprintf("pre(%s)", account.AddressHash)] = account
+	}
+	if addr != nil {
+		d.Accounts[(*addr).String()] = account
+	}
 }
 
 // iterativeDump is a DumpCollector-implementation which dumps output line-by-line iteratively.
@@ -99,19 +88,16 @@ type iterativeDump struct {
 }
 
 // OnAccount implements DumpCollector interface
-func (d iterativeDump) OnAccount(addr common.Address, account DumpAccount) {
+func (d iterativeDump) OnAccount(addr *common.Address, account DumpAccount) {
 	dumpAccount := &DumpAccount{
-		Balance:   account.Balance,
-		Nonce:     account.Nonce,
-		Root:      account.Root,
-		CodeHash:  account.CodeHash,
-		Code:      account.Code,
-		Storage:   account.Storage,
-		SecureKey: account.SecureKey,
-		Address:   nil,
-	}
-	if addr != (common.Address{}) {
-		dumpAccount.Address = &addr
+		Balance:     account.Balance,
+		Nonce:       account.Nonce,
+		Root:        account.Root,
+		CodeHash:    account.CodeHash,
+		Code:        account.Code,
+		Storage:     account.Storage,
+		AddressHash: account.AddressHash,
+		Address:     addr,
 	}
 	d.Encode(dumpAccount)
 }
@@ -125,7 +111,7 @@ func (d iterativeDump) OnRoot(root common.Hash) {
 
 // DumpToCollector iterates the state according to the given options and inserts
 // the items into a collector for aggregation or serialization.
-func (s *StateDB) DumpToCollector(c DumpCollector, conf *DumpConfig) (nextKey []byte) {
+func (s *StateDB) DumpToCollector(c DumpCollector, conf *DumpConfig) (nextKey []byte, err error) {
 	// Sanitize the input to allow nil configs
 	if conf == nil {
 		conf = new(DumpConfig)
@@ -136,58 +122,85 @@ func (s *StateDB) DumpToCollector(c DumpCollector, conf *DumpConfig) (nextKey []
 		start            = time.Now()
 		logged           = time.Now()
 	)
-	log.Info("Trie dumping started", "root", s.trie.Hash())
-	c.OnRoot(s.trie.Hash())
+	log.Info("Trie dumping started", "root", s.originalRoot)
+	c.OnRoot(s.originalRoot)
 
-	it := trie.NewIterator(s.trie.NodeIterator(conf.Start))
-	for it.Next() {
-		var data types.StateAccount
-		if err := rlp.DecodeBytes(it.Value, &data); err != nil {
-			panic(err)
+	iteratee, err := s.db.Iteratee(s.originalRoot)
+	if err != nil {
+		return nil, err
+	}
+	var startHash common.Hash
+	if conf.Start != nil {
+		startHash = common.BytesToHash(conf.Start)
+	}
+	acctIt, err := iteratee.NewAccountIterator(startHash)
+	if err != nil {
+		return nil, err
+	}
+	defer acctIt.Release()
+
+	for acctIt.Next() {
+		data := acctIt.Account()
+		if err := acctIt.Error(); err != nil {
+			return nil, err
 		}
-		account := DumpAccount{
-			Balance:   data.Balance.String(),
-			Nonce:     data.Nonce,
-			Root:      data.Root[:],
-			CodeHash:  data.CodeHash,
-			SecureKey: it.Key,
+		if data == nil {
+			return nil, fmt.Errorf("unexpected nil account value")
 		}
-		addrBytes := s.trie.GetKey(it.Key)
-		if addrBytes == nil {
-			// Preimage missing
+		var (
+			account = DumpAccount{
+				Balance:     data.Balance.String(),
+				Nonce:       data.Nonce,
+				Root:        data.Root[:],
+				CodeHash:    data.CodeHash,
+				AddressHash: acctIt.Hash().Bytes(),
+			}
+			address *common.Address
+		)
+		addrBytes, err := acctIt.Address()
+		if err != nil {
 			missingPreimages++
 			if conf.OnlyWithAddresses {
 				continue
 			}
-			account.SecureKey = it.Key
+		} else {
+			address = &addrBytes
+			account.Address = address
 		}
-		addr := common.BytesToAddress(addrBytes)
-		obj := newObject(s, addr, data)
+		obj := newObject(s, addrBytes, data)
 		if !conf.SkipCode {
-			account.Code = obj.Code(s.db)
+			account.Code = obj.Code()
 		}
 		if !conf.SkipStorage {
 			account.Storage = make(map[common.Hash]string)
-			storageIt := trie.NewIterator(obj.getTrie(s.db).NodeIterator(nil))
+
+			storageIt, err := iteratee.NewStorageIterator(acctIt.Hash(), common.Hash{})
+			if err != nil {
+				return nil, err
+			}
 			for storageIt.Next() {
-				_, content, _, err := rlp.Split(storageIt.Value)
+				val := storageIt.Slot()
+				if err := storageIt.Error(); err != nil {
+					storageIt.Release()
+					return nil, err
+				}
+				key, err := storageIt.Key()
 				if err != nil {
-					log.Error("Failed to decode the value returned by iterator", "error", err)
 					continue
 				}
-				account.Storage[common.BytesToHash(s.trie.GetKey(storageIt.Key))] = common.Bytes2Hex(content)
+				account.Storage[key] = common.Bytes2Hex(common.TrimLeftZeroes(val[:]))
 			}
+			storageIt.Release()
 		}
-		c.OnAccount(addr, account)
+		c.OnAccount(address, account)
 		accounts++
 		if time.Since(logged) > 8*time.Second {
-			log.Info("Trie dumping in progress", "at", it.Key, "accounts", accounts,
-				"elapsed", common.PrettyDuration(time.Since(start)))
+			log.Info("Trie dumping in progress", "at", acctIt.Hash().Hex(), "accounts", accounts, "elapsed", common.PrettyDuration(time.Since(start)))
 			logged = time.Now()
 		}
 		if conf.Max > 0 && accounts >= conf.Max {
-			if it.Next() {
-				nextKey = it.Key
+			if acctIt.Next() {
+				nextKey = acctIt.Hash().Bytes()
 			}
 			break
 		}
@@ -195,18 +208,18 @@ func (s *StateDB) DumpToCollector(c DumpCollector, conf *DumpConfig) (nextKey []
 	if missingPreimages > 0 {
 		log.Warn("Dump incomplete due to missing preimages", "missing", missingPreimages)
 	}
-	log.Info("Trie dumping complete", "accounts", accounts,
-		"elapsed", common.PrettyDuration(time.Since(start)))
-
-	return nextKey
+	log.Info("Trie dumping complete", "accounts", accounts, "elapsed", common.PrettyDuration(time.Since(start)))
+	return nextKey, nil
 }
 
-// RawDump returns the entire state an a single large object
+// RawDump returns the state. If the processing is aborted e.g. due to options
+// reaching Max, the `Next` key is set on the returned Dump.
 func (s *StateDB) RawDump(opts *DumpConfig) Dump {
 	dump := &Dump{
-		Accounts: make(map[common.Address]DumpAccount),
+		Accounts: make(map[string]DumpAccount),
 	}
-	s.DumpToCollector(dump, opts)
+	next, _ := s.DumpToCollector(dump, opts)
+	dump.Next = next
 	return *dump
 }
 
@@ -215,7 +228,7 @@ func (s *StateDB) Dump(opts *DumpConfig) []byte {
 	dump := s.RawDump(opts)
 	json, err := json.MarshalIndent(dump, "", "    ")
 	if err != nil {
-		fmt.Println("Dump err", err)
+		log.Error("Error dumping state", "err", err)
 	}
 	return json
 }
@@ -223,13 +236,4 @@ func (s *StateDB) Dump(opts *DumpConfig) []byte {
 // IterativeDump dumps out accounts as json-objects, delimited by linebreaks on stdout
 func (s *StateDB) IterativeDump(opts *DumpConfig, output *json.Encoder) {
 	s.DumpToCollector(iterativeDump{output}, opts)
-}
-
-// IteratorDump dumps out a batch of accounts starts with the given start key
-func (s *StateDB) IteratorDump(opts *DumpConfig) IteratorDump {
-	iterator := &IteratorDump{
-		Accounts: make(map[common.Address]DumpAccount),
-	}
-	iterator.Next = s.DumpToCollector(iterator, opts)
-	return *iterator
 }

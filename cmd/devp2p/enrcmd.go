@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,7 +49,7 @@ func enrdump(ctx *cli.Context) error {
 	var source string
 	if file := ctx.String(fileFlag.Name); file != "" {
 		if ctx.NArg() != 0 {
-			return fmt.Errorf("can't dump record from command-line argument in -file mode")
+			return errors.New("can't dump record from command-line argument in -file mode")
 		}
 		var b []byte
 		var err error
@@ -64,7 +65,7 @@ func enrdump(ctx *cli.Context) error {
 	} else if ctx.NArg() == 1 {
 		source = ctx.Args().First()
 	} else {
-		return fmt.Errorf("need record as argument")
+		return errors.New("need record as argument")
 	}
 
 	r, err := parseRecord(source)
@@ -182,8 +183,8 @@ var attrFormatters = map[string]func(rlp.RawValue) (string, bool){
 }
 
 func formatAttrRaw(v rlp.RawValue) (string, bool) {
-	s := hex.EncodeToString(v)
-	return s, true
+	content, _, err := rlp.SplitString(v)
+	return hex.EncodeToString(content), err == nil
 }
 
 func formatAttrString(v rlp.RawValue) (string, bool) {
@@ -193,7 +194,7 @@ func formatAttrString(v rlp.RawValue) (string, bool) {
 
 func formatAttrIP(v rlp.RawValue) (string, bool) {
 	content, _, err := rlp.SplitString(v)
-	if err != nil || len(content) != 4 && len(content) != 6 {
+	if err != nil || len(content) != 4 && len(content) != 16 {
 		return "", false
 	}
 	return net.IP(content).String(), true

@@ -23,16 +23,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/internal/telemetry"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 const (
-	maxRequestContentLength = 1024 * 1024 * 5
-	contentType             = "application/json"
+	defaultBodyLimit = 5 * 1024 * 1024
+	contentType      = "application/json"
 )
 
 // https://www.jsonrpc.org/historical/json-rpc-over-http.html#id13
@@ -46,14 +52,19 @@ type httpConn struct {
 	mu        sync.Mutex // protects headers
 	headers   http.Header
 	auth      HTTPAuth
+	tmprop    propagation.TextMapPropagator
 }
 
 // httpConn implements ServerCodec, but it is treated specially by Client
 // and some methods don't work. The panic() stubs here exist to ensure
 // this special treatment is correct.
 
-func (hc *httpConn) writeJSON(context.Context, interface{}) error {
+func (hc *httpConn) writeJSON(context.Context, *jsonrpcMessage, bool) error {
 	panic("writeJSON called on httpConn")
+}
+
+func (hc *httpConn) writeJSONBatch(context.Context, []*jsonrpcMessage, bool) error {
+	panic("writeJSONBatch called on httpConn")
 }
 
 func (hc *httpConn) peerInfo() PeerInfo {
@@ -135,8 +146,9 @@ func DialHTTPWithClient(endpoint string, client *http.Client) (*Client, error) {
 	}
 
 	var cfg clientConfig
+	cfg.httpClient = client
 	fn := newClientTransportHTTP(endpoint, &cfg)
-	return newClient(context.Background(), fn)
+	return newClient(context.Background(), &cfg, fn)
 }
 
 func newClientTransportHTTP(endpoint string, cfg *clientConfig) reconnectFunc {
@@ -157,6 +169,7 @@ func newClientTransportHTTP(endpoint string, cfg *clientConfig) reconnectFunc {
 		headers: headers,
 		url:     endpoint,
 		auth:    cfg.httpAuth,
+		tmprop:  cfg.tmprop,
 		closeCh: make(chan interface{}),
 	}
 
@@ -165,48 +178,49 @@ func newClientTransportHTTP(endpoint string, cfg *clientConfig) reconnectFunc {
 	}
 }
 
-func (c *Client) sendHTTP(ctx context.Context, op *requestOp, msg interface{}) error {
+// cleanlyCloseBody avoids sending unnecessary RST_STREAM and PING frames by
+// ensuring the whole body is read before being closed.
+// See https://blog.cloudflare.com/go-and-enhance-your-calm/#reading-bodies-in-go-can-be-unintuitive
+func cleanlyCloseBody(body io.ReadCloser) error {
+	io.Copy(io.Discard, body)
+	return body.Close()
+}
+
+func (c *Client) sendHTTP(ctx context.Context, op *requestOp, msg *jsonrpcMessage) error {
 	hc := c.writeConn.(*httpConn)
-	respBody, err := hc.doRequest(ctx, msg)
+	respBody, err := hc.doRequest(ctx, appendMessage(nil, msg))
 	if err != nil {
 		return err
 	}
-	defer respBody.Close()
+	defer cleanlyCloseBody(respBody)
 
-	var respmsg jsonrpcMessage
-	if err := json.NewDecoder(respBody).Decode(&respmsg); err != nil {
+	var resp jsonrpcMessage
+	batch := [1]*jsonrpcMessage{&resp}
+	if err := json.NewDecoder(respBody).Decode(&resp); err != nil {
 		return err
 	}
-	op.resp <- &respmsg
+	op.resp <- batch[:]
 	return nil
 }
 
 func (c *Client) sendBatchHTTP(ctx context.Context, op *requestOp, msgs []*jsonrpcMessage) error {
 	hc := c.writeConn.(*httpConn)
-	respBody, err := hc.doRequest(ctx, msgs)
+	respBody, err := hc.doRequest(ctx, appendBatch(nil, msgs))
 	if err != nil {
 		return err
 	}
-	defer respBody.Close()
-	var respmsgs []jsonrpcMessage
+	defer cleanlyCloseBody(respBody)
+
+	var respmsgs []*jsonrpcMessage
 	if err := json.NewDecoder(respBody).Decode(&respmsgs); err != nil {
 		return err
 	}
-	if len(respmsgs) != len(msgs) {
-		return fmt.Errorf("batch has %d requests but response has %d: %w", len(msgs), len(respmsgs), ErrBadResult)
-	}
-	for i := 0; i < len(respmsgs); i++ {
-		op.resp <- &respmsgs[i]
-	}
+	op.resp <- respmsgs
 	return nil
 }
 
-func (hc *httpConn) doRequest(ctx context.Context, msg interface{}) (io.ReadCloser, error) {
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, "POST", hc.url, io.NopCloser(bytes.NewReader(body)))
+func (hc *httpConn) doRequest(ctx context.Context, body []byte) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hc.url, io.NopCloser(bytes.NewReader(body)))
 	if err != nil {
 		return nil, err
 	}
@@ -217,6 +231,11 @@ func (hc *httpConn) doRequest(ctx context.Context, msg interface{}) (io.ReadClos
 	hc.mu.Lock()
 	req.Header = hc.headers.Clone()
 	hc.mu.Unlock()
+	setHeaders(req.Header, headersFromContext(ctx))
+	if hc.tmprop != nil {
+		hc.tmprop.Inject(ctx, propagation.HeaderCarrier(req.Header))
+	}
+
 	if hc.auth != nil {
 		if err := hc.auth(req.Header); err != nil {
 			return nil, err
@@ -234,7 +253,7 @@ func (hc *httpConn) doRequest(ctx context.Context, msg interface{}) (io.ReadClos
 		if _, err := buf.ReadFrom(resp.Body); err == nil {
 			body = buf.Bytes()
 		}
-
+		cleanlyCloseBody(resp.Body)
 		return nil, HTTPError{
 			Status:     resp.Status,
 			StatusCode: resp.StatusCode,
@@ -251,10 +270,92 @@ type httpServerConn struct {
 	r *http.Request
 }
 
-func newHTTPServerConn(r *http.Request, w http.ResponseWriter) ServerCodec {
-	body := io.LimitReader(r.Body, maxRequestContentLength)
+func (s *Server) newHTTPServerConn(r *http.Request, w http.ResponseWriter) ServerCodec {
+	body := io.LimitReader(r.Body, int64(s.httpBodyLimit))
 	conn := &httpServerConn{Reader: body, Writer: w, r: r}
-	return NewCodec(conn)
+
+	var buf []byte
+	encodeMsg := func(ctx context.Context, msg *jsonrpcMessage, isError bool) error {
+		buf = appendMessage(buf[:0], msg)
+		return httpWrite(ctx, w, buf, isError)
+	}
+	encodeBatch := func(ctx context.Context, msgs []*jsonrpcMessage, isError bool) error {
+		buf = appendBatch(buf[:0], msgs)
+		return httpWrite(ctx, w, buf, isError)
+	}
+
+	// The body holds one message, so it can be read in one go and checked once.
+	readFrame := func() ([]byte, error) {
+		hint := 0
+		if r.ContentLength > 0 && r.ContentLength <= int64(s.httpBodyLimit) {
+			hint = int(r.ContentLength)
+		}
+		frame, err := readAllBody(body, hint)
+		if err != nil {
+			return nil, err
+		}
+		if len(bytes.TrimSpace(frame)) == 0 {
+			// An empty body carries no message, which is not an error. The
+			// decoder used to report this as EOF and callers rely on that.
+			return nil, io.EOF
+		}
+		return frame, nil
+	}
+	return newFuncCodec(conn, encodeMsg, encodeBatch, nil, readFrame)
+}
+
+// readAllBody reads r to the end, sizing the buffer from the hint when there is
+// one so that a large body does not have to be grown into.
+func readAllBody(r io.Reader, hint int) ([]byte, error) {
+	// A byte past the hint, so a body of exactly hint bytes sees EOF without
+	// the buffer doubling right at the end.
+	buf := make([]byte, 0, max(hint+1, 512))
+	for {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)]
+		}
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err != nil {
+			if err == io.EOF {
+				return buf, nil
+			}
+			return buf, err
+		}
+	}
+}
+
+// httpWrite writes pre-encoded response data over HTTP.
+func httpWrite(ctx context.Context, w http.ResponseWriter, data []byte, isError bool) (err error) {
+	_, _, spanEnd := telemetry.StartSpanWithTracer(ctx, telemetry.TracerFromContext(ctx), "rpc.httpWrite")
+	defer spanEnd(&err)
+
+	w.Header().Set("content-length", strconv.Itoa(len(data)))
+
+	if !isError {
+		// Normal path, just send the response and let the HTTP server decide
+		// when to flush.
+		_, err = w.Write(data)
+		return err
+	}
+
+	// It's an error response and requires special treatment.
+	//
+	// In case of a timeout error, the response must be written before the HTTP
+	// server's write timeout occurs. So we need to flush the response.
+	//
+	// If this request is wrapped in a handler that might remove Content-Length (such
+	// as the automatic gzip we do in package node), we need to ensure the HTTP server
+	// doesn't perform chunked encoding. In case WriteTimeout is reached, the chunked
+	// encoding might not be finished correctly, and some clients do not like it when
+	// the final chunk is missing. To do this, we set TE = identity, which is a signal
+	// recognized by outer handlers to avoid compression.
+	w.Header().Set("transfer-encoding", "identity")
+	_, err = w.Write(data)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return err
 }
 
 // Close does nothing and always returns nil.
@@ -275,7 +376,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if code, err := validateRequest(r); err != nil {
+	if code, err := s.validateRequest(r); err != nil {
 		http.Error(w, err.Error(), code)
 		return
 	}
@@ -289,23 +390,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ctx = context.WithValue(ctx, peerInfoContextKey{}, connInfo)
 
+	// Extract trace context from incoming headers.
+	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(r.Header))
+
 	// All checks passed, create a codec that reads directly from the request body
 	// until EOF, writes the response to w, and orders the server to process a
 	// single request.
 	w.Header().Set("content-type", contentType)
-	codec := newHTTPServerConn(r, w)
+	codec := s.newHTTPServerConn(r, w)
 	defer codec.close()
 	s.serveSingleRequest(ctx, codec)
 }
 
 // validateRequest returns a non-zero response code and error message if the
 // request is invalid.
-func validateRequest(r *http.Request) (int, error) {
+func (s *Server) validateRequest(r *http.Request) (int, error) {
 	if r.Method == http.MethodPut || r.Method == http.MethodDelete {
 		return http.StatusMethodNotAllowed, errors.New("method not allowed")
 	}
-	if r.ContentLength > maxRequestContentLength {
-		err := fmt.Errorf("content length too large (%d>%d)", r.ContentLength, maxRequestContentLength)
+	if r.ContentLength > int64(s.httpBodyLimit) {
+		err := fmt.Errorf("content length too large (%d>%d)", r.ContentLength, s.httpBodyLimit)
 		return http.StatusRequestEntityTooLarge, err
 	}
 	// Allow OPTIONS (regardless of content-type)
@@ -323,4 +427,36 @@ func validateRequest(r *http.Request) (int, error) {
 	// Invalid content-type
 	err := fmt.Errorf("invalid content type, only %s is supported", contentType)
 	return http.StatusUnsupportedMediaType, err
+}
+
+// ContextRequestTimeout returns the request timeout derived from the given context.
+func ContextRequestTimeout(ctx context.Context) (time.Duration, bool) {
+	timeout := time.Duration(math.MaxInt64)
+	hasTimeout := false
+	setTimeout := func(d time.Duration) {
+		if d < timeout {
+			timeout = d
+			hasTimeout = true
+		}
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		setTimeout(time.Until(deadline))
+	}
+
+	// If the context is an HTTP request context, use the server's WriteTimeout.
+	httpSrv, ok := ctx.Value(http.ServerContextKey).(*http.Server)
+	if ok && httpSrv.WriteTimeout > 0 {
+		wt := httpSrv.WriteTimeout
+		// When a write timeout is configured, we need to send the response message before
+		// the HTTP server cuts connection. So our internal timeout must be earlier than
+		// the server's true timeout.
+		//
+		// Note: Timeouts are sanitized to be a minimum of 1 second.
+		// Also see issue: https://github.com/golang/go/issues/47229
+		wt -= 100 * time.Millisecond
+		setTimeout(wt)
+	}
+
+	return timeout, hasTimeout
 }

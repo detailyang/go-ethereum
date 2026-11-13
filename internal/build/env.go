@@ -28,12 +28,13 @@ import (
 
 var (
 	// These flags override values in build env.
-	GitCommitFlag   = flag.String("git-commit", "", `Overrides git commit hash embedded into executables`)
-	GitBranchFlag   = flag.String("git-branch", "", `Overrides git branch being built`)
-	GitTagFlag      = flag.String("git-tag", "", `Overrides git tag being built`)
-	BuildnumFlag    = flag.String("buildnum", "", `Overrides CI build number`)
-	PullRequestFlag = flag.Bool("pull-request", false, `Overrides pull request status of the build`)
-	CronJobFlag     = flag.Bool("cron-job", false, `Overrides cron job status of the build`)
+	GitCommitFlag     = flag.String("git-commit", "", `Overrides git commit hash embedded into executables`)
+	GitBranchFlag     = flag.String("git-branch", "", `Overrides git branch being built`)
+	GitTagFlag        = flag.String("git-tag", "", `Overrides git tag being built`)
+	BuildnumFlag      = flag.String("buildnum", "", `Overrides CI build number`)
+	PullRequestFlag   = flag.Bool("pull-request", false, `Overrides pull request status of the build`)
+	CronJobFlag       = flag.Bool("cron-job", false, `Overrides cron job status of the build`)
+	UbuntuVersionFlag = flag.String("ubuntu", "", `Sets the ubuntu version being built for`)
 )
 
 // Environment contains metadata provided by the build environment.
@@ -43,6 +44,7 @@ type Environment struct {
 	Repo                      string // name of GitHub repo
 	Commit, Date, Branch, Tag string // Git info
 	Buildnum                  string
+	UbuntuVersion             string // Ubuntu version being built for
 	IsPullRequest             bool
 	IsCronJob                 bool
 }
@@ -90,6 +92,33 @@ func Env() Environment {
 			IsPullRequest: os.Getenv("APPVEYOR_PULL_REQUEST_NUMBER") != "",
 			IsCronJob:     os.Getenv("APPVEYOR_SCHEDULED_BUILD") == "True",
 		}
+	case os.Getenv("CI") == "true" && os.Getenv("GITHUB_ACTIONS") == "true":
+		commit := os.Getenv("GITHUB_SHA")
+		reftype := os.Getenv("GITHUB_REF_TYPE")
+		isPR := os.Getenv("GITHUB_HEAD_REF") != ""
+		tag := ""
+		branch := ""
+		switch {
+		case isPR:
+			branch = os.Getenv("GITHUB_BASE_REF")
+		case reftype == "branch":
+			branch = os.Getenv("GITHUB_REF_NAME")
+		case reftype == "tag":
+			tag = os.Getenv("GITHUB_REF_NAME")
+		}
+		return Environment{
+			CI:            true,
+			Name:          "github-actions",
+			Repo:          os.Getenv("GITHUB_REPOSITORY"),
+			Commit:        commit,
+			Date:          getDate(commit),
+			Branch:        branch,
+			Tag:           tag,
+			IsPullRequest: isPR,
+			Buildnum:      os.Getenv("GITHUB_RUN_ID"),
+			IsCronJob:     os.Getenv("GITHUB_EVENT_NAME") == "schedule",
+		}
+
 	default:
 		return LocalEnv()
 	}
@@ -99,6 +128,48 @@ func Env() Environment {
 func LocalEnv() Environment {
 	env := applyEnvFlags(Environment{Name: "local", Repo: "ethereum/go-ethereum"})
 
+	// Ask git instead of reading .git: in a worktree or a submodule, .git is a
+	// file pointing to the repository, and refs may be packed.
+	topInfo, err := os.Stat(gitOutput("rev-parse", "--show-toplevel"))
+	if err != nil {
+		// git is missing, refuses the repository or isn't in one, or gives a
+		// path Go can't open (MSYS git on Windows): read .git as before.
+		return localEnvFromFiles(env)
+	}
+	if wdInfo, err := os.Stat("."); err != nil || !os.SameFile(topInfo, wdInfo) {
+		// Not the top of the working tree, as a source archive unpacked
+		// inside another repository: don't take that repository's commit.
+		return env
+	}
+	// Not symbolic-ref --short, which gives heads/master when a tag is
+	// named master too.
+	branch, ok := strings.CutPrefix(gitOutput("symbolic-ref", "-q", "HEAD"), "refs/heads/")
+	if !ok {
+		// In this case we are in "detached head" state
+		// see: https://git-scm.com/docs/git-checkout#_detached_head
+		if env.Commit == "" {
+			env.Commit = gitOutput("rev-parse", "HEAD")
+			env.Date = getDate(env.Commit)
+		}
+		return env
+	}
+	if env.Commit == "" {
+		env.Commit = gitOutput("rev-parse", "HEAD")
+	}
+	env.Date = getDate(env.Commit)
+	if env.Branch == "" {
+		env.Branch = branch
+	}
+	if env.Tag == "" {
+		env.Tag = firstLine(gitOutput("tag", "-l", "--points-at", "HEAD"))
+	}
+	return env
+}
+
+// localEnvFromFiles reads the commit and the branch from .git directly, for
+// when git can't tell. It finds nothing in a worktree or a submodule, or when
+// the branch's ref is packed.
+func localEnvFromFiles(env Environment) Environment {
 	head := readGitFile("HEAD")
 	if fields := strings.Fields(head); len(fields) == 2 {
 		head = fields[1]
@@ -109,6 +180,7 @@ func LocalEnv() Environment {
 		commitRe, _ := regexp.Compile("^([0-9a-f]{40})$")
 		if commit := commitRe.FindString(head); commit != "" && env.Commit == "" {
 			env.Commit = commit
+			env.Date = getDate(env.Commit)
 		}
 		return env
 	}
@@ -167,6 +239,9 @@ func applyEnvFlags(env Environment) Environment {
 	}
 	if *CronJobFlag {
 		env.IsCronJob = true
+	}
+	if *UbuntuVersionFlag != "" {
+		env.UbuntuVersion = *UbuntuVersionFlag
 	}
 	return env
 }

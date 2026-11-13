@@ -30,6 +30,7 @@ import (
 // TestEthProtocolNegotiation tests whether the test suite
 // can negotiate the highest eth protocol in a status message exchange
 func TestEthProtocolNegotiation(t *testing.T) {
+	t.Parallel()
 	var tests = []struct {
 		conn     *Conn
 		caps     []p2p.Cap
@@ -122,30 +123,45 @@ func TestEthProtocolNegotiation(t *testing.T) {
 	}
 }
 
-// TestChain_GetHeaders tests whether the test suite can correctly
-// respond to a GetBlockHeaders request from a node.
-func TestChain_GetHeaders(t *testing.T) {
-	chainFile, err := filepath.Abs("./testdata/chain.rlp")
+// TestChainHasAmsterdamWindow ensures the checked-in fixture keeps the recent
+// block window exercised by the eth/71 and snap/2 tests past Amsterdam.
+func TestChainHasAmsterdamWindow(t *testing.T) {
+	chain, err := NewChain("./testdata")
 	if err != nil {
 		t.Fatal(err)
 	}
-	genesisFile, err := filepath.Abs("./testdata/genesis.json")
-	if err != nil {
-		t.Fatal(err)
+	start := chain.Len() - 16
+	if start < 0 {
+		start = 0
 	}
+	for i := start; i < chain.Len(); i++ {
+		if chain.blocks[i].BlockAccessListHash() == nil {
+			t.Fatalf("test chain block %d has no block access list commitment", i)
+		}
+	}
+}
 
-	chain, err := loadChain(chainFile, genesisFile)
+// TestChainGetHeaders tests whether the test suite can correctly
+// respond to a GetBlockHeaders request from a node.
+func TestChainGetHeaders(t *testing.T) {
+	t.Parallel()
+
+	dir, err := filepath.Abs("./testdata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := NewChain(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var tests = []struct {
-		req      GetBlockHeaders
+		req      eth.GetBlockHeadersPacket
 		expected []*types.Header
 	}{
 		{
-			req: GetBlockHeaders{
-				GetBlockHeadersPacket: &eth.GetBlockHeadersPacket{
+			req: eth.GetBlockHeadersPacket{
+				GetBlockHeadersRequest: &eth.GetBlockHeadersRequest{
 					Origin:  eth.HashOrNumber{Number: uint64(2)},
 					Amount:  uint64(5),
 					Skip:    1,
@@ -161,8 +177,8 @@ func TestChain_GetHeaders(t *testing.T) {
 			},
 		},
 		{
-			req: GetBlockHeaders{
-				GetBlockHeadersPacket: &eth.GetBlockHeadersPacket{
+			req: eth.GetBlockHeadersPacket{
+				GetBlockHeadersRequest: &eth.GetBlockHeadersRequest{
 					Origin:  eth.HashOrNumber{Number: uint64(chain.Len() - 1)},
 					Amount:  uint64(3),
 					Skip:    0,
@@ -176,8 +192,8 @@ func TestChain_GetHeaders(t *testing.T) {
 			},
 		},
 		{
-			req: GetBlockHeaders{
-				GetBlockHeadersPacket: &eth.GetBlockHeadersPacket{
+			req: eth.GetBlockHeadersPacket{
+				GetBlockHeadersRequest: &eth.GetBlockHeadersRequest{
 					Origin:  eth.HashOrNumber{Hash: chain.Head().Hash()},
 					Amount:  uint64(1),
 					Skip:    0,
@@ -186,6 +202,21 @@ func TestChain_GetHeaders(t *testing.T) {
 			},
 			expected: []*types.Header{
 				chain.Head().Header(),
+			},
+		},
+		{
+			req: eth.GetBlockHeadersPacket{
+				GetBlockHeadersRequest: &eth.GetBlockHeadersRequest{
+					Origin:  eth.HashOrNumber{Number: uint64(10)},
+					Amount:  uint64(3),
+					Skip:    1,
+					Reverse: true,
+				},
+			},
+			expected: []*types.Header{
+				chain.blocks[10].Header(),
+				chain.blocks[8].Header(),
+				chain.blocks[6].Header(),
 			},
 		},
 	}

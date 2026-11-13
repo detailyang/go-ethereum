@@ -25,22 +25,28 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/fetcher"
+	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 )
 
 var (
-	peers []string
-	txs   []*types.Transaction
+	peers        []string
+	peerVersions map[string]uint
+	txs          []*types.Transaction
 )
 
 func init() {
 	// Random is nice, but we need it deterministic
 	rand := rand.New(rand.NewSource(0x3a29))
 
+	supportedVersions := []uint{eth.ETH69, eth.ETH70, eth.ETH72}
 	peers = make([]string, 10)
+	peerVersions = make(map[string]uint, len(peers))
 	for i := 0; i < len(peers); i++ {
 		peers[i] = fmt.Sprintf("Peer #%d", i)
+		peerVersions[peers[i]] = supportedVersions[i%len(supportedVersions)]
 	}
 	txs = make([]*types.Transaction, 65536) // We need to bump enough to hit all the limits
 	for i := 0; i < len(txs); i++ {
@@ -48,7 +54,7 @@ func init() {
 	}
 }
 
-func Fuzz(input []byte) int {
+func fuzz(input []byte) int {
 	// Don't generate insanely large test cases, not much value in them
 	if len(input) > 16*1024 {
 		return 0
@@ -78,12 +84,25 @@ func Fuzz(input []byte) int {
 	rand := rand.New(rand.NewSource(0x3a29)) // Same used in package tests!!!
 
 	f := fetcher.NewTxFetcherForTests(
-		func(common.Hash) bool { return false },
+		nil,
+		func(common.Hash, byte) error { return nil },
 		func(txs []*types.Transaction) []error {
 			return make([]error, len(txs))
 		},
 		func(string, []common.Hash) error { return nil },
-		clock, rand,
+		nil,
+		nil,
+		blobpool.NewBlobBuffer(blobpool.BlobBufferFunctions{
+			ValidateTx: func(*types.Transaction) error { return nil },
+			AddToPool:  func(*blobpool.BlobTxForPool) error { return nil },
+			DropPeer:   func(string) {},
+		}),
+		clock,
+		func() time.Time {
+			nanoTime := int64(clock.Now())
+			return time.Unix(nanoTime/1000000000, nanoTime%1000000000)
+		},
+		rand,
 	)
 	f.Start()
 	defer f.Stop()
@@ -116,6 +135,8 @@ func Fuzz(input []byte) int {
 			var (
 				announceIdxs = make([]int, announce)
 				announces    = make([]common.Hash, announce)
+				types        = make([]byte, announce)
+				sizes        = make([]uint32, announce)
 			)
 			for i := 0; i < len(announces); i++ {
 				annBuf := make([]byte, 2)
@@ -124,11 +145,13 @@ func Fuzz(input []byte) int {
 				}
 				announceIdxs[i] = (int(annBuf[0])*256 + int(annBuf[1])) % len(txs)
 				announces[i] = txs[announceIdxs[i]].Hash()
+				types[i] = txs[announceIdxs[i]].Type()
+				sizes[i] = uint32(txs[announceIdxs[i]].Size())
 			}
 			if verbose {
 				fmt.Println("Notify", peer, announceIdxs)
 			}
-			if err := f.Notify(peer, announces); err != nil {
+			if _, err := f.Notify(peer, peerVersions[peer], types, sizes, announces); err != nil {
 				panic(err)
 			}
 
@@ -169,7 +192,7 @@ func Fuzz(input []byte) int {
 			if verbose {
 				fmt.Println("Enqueue", peer, deliverIdxs, direct)
 			}
-			if err := f.Enqueue(peer, deliveries, direct); err != nil {
+			if err := f.Enqueue(peer, peerVersions[peer], deliveries, direct); err != nil {
 				panic(err)
 			}
 

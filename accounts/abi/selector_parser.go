@@ -17,6 +17,7 @@
 package abi
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -40,7 +41,7 @@ func isIdentifierSymbol(c byte) bool {
 
 func parseToken(unescapedSelector string, isIdent bool) (string, string, error) {
 	if len(unescapedSelector) == 0 {
-		return "", "", fmt.Errorf("empty token")
+		return "", "", errors.New("empty token")
 	}
 	firstChar := unescapedSelector[0]
 	position := 1
@@ -74,8 +75,11 @@ func parseElementaryType(unescapedSelector string) (string, string, error) {
 			parsedType = parsedType + string(rest[0])
 			rest = rest[1:]
 		}
-		if len(rest) == 0 || rest[0] != ']' {
-			return "", "", fmt.Errorf("failed to parse array: expected ']', got %c", unescapedSelector[0])
+		if len(rest) == 0 {
+			return "", "", fmt.Errorf("failed to parse array: expected ']', got end of string")
+		}
+		if rest[0] != ']' {
+			return "", "", fmt.Errorf("failed to parse array: expected ']', got %c", rest[0])
 		}
 		parsedType = parsedType + string(rest[0])
 		rest = rest[1:]
@@ -110,7 +114,7 @@ func parseCompositeType(unescapedSelector string) ([]interface{}, string, error)
 
 func parseType(unescapedSelector string) (interface{}, string, error) {
 	if len(unescapedSelector) == 0 {
-		return nil, "", fmt.Errorf("empty type")
+		return nil, "", errors.New("empty type")
 	}
 	if unescapedSelector[0] == '(' {
 		return parseCompositeType(unescapedSelector)

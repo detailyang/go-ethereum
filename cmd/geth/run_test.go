@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/pkg/reexec"
 	"github.com/ethereum/go-ethereum/internal/cmdtest"
+	"github.com/ethereum/go-ethereum/internal/reexec"
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
@@ -32,8 +32,7 @@ type testgeth struct {
 	*cmdtest.TestCmd
 
 	// template variables for expect
-	Datadir   string
-	Etherbase string
+	Datadir string
 }
 
 func init() {
@@ -55,6 +54,15 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func initGeth(t *testing.T) string {
+	args := []string{"--networkid=42", "init", "./testdata/clique.json"}
+	t.Logf("Initializing geth: %v ", args)
+	g := runGeth(t, args...)
+	datadir := g.Datadir
+	g.WaitExit()
+	return datadir
+}
+
 // spawns geth with the given command line args. If the args don't set --datadir, the
 // child g gets a temporary data directory.
 func runGeth(t *testing.T, args ...string) *testgeth {
@@ -65,10 +73,6 @@ func runGeth(t *testing.T, args ...string) *testgeth {
 		case "--datadir":
 			if i < len(args)-1 {
 				tt.Datadir = args[i+1]
-			}
-		case "--miner.etherbase":
-			if i < len(args)-1 {
-				tt.Etherbase = args[i+1]
 			}
 		}
 	}

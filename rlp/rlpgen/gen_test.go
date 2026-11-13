@@ -26,6 +26,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -47,12 +48,14 @@ func init() {
 	}
 }
 
-var tests = []string{"uints", "nil", "rawvalue", "optional", "bigint"}
+var tests = []string{"uints", "nil", "rawvalue", "optional", "bigint", "uint256", "pkgclash"}
 
 func TestOutput(t *testing.T) {
 	for _, test := range tests {
-		test := test
 		t.Run(test, func(t *testing.T) {
+			if test == "pkgclash" && runtime.GOOS == "windows" {
+				t.Skip("source-based importer is pathologically slow on Windows/NTFS")
+			}
 			inputFile := filepath.Join("testdata", test+".in.txt")
 			outputFile := filepath.Join("testdata", test+".out.txt")
 			bctx, typ, err := loadTestSource(inputFile, "Test")
@@ -75,7 +78,7 @@ func TestOutput(t *testing.T) {
 				t.Fatal("error loading expected test output:", err)
 			}
 			if !bytes.Equal(output, wantOutput) {
-				t.Fatal("output mismatch:\n", string(output))
+				t.Fatalf("output mismatch, want: %v got %v", string(wantOutput), string(output))
 			}
 		})
 	}

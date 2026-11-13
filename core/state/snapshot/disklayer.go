@@ -23,25 +23,48 @@ import (
 	"github.com/VictoriaMetrics/fastcache"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/trie"
+	"github.com/ethereum/go-ethereum/triedb"
 )
 
 // diskLayer is a low level persistent snapshot built on top of a key-value store.
 type diskLayer struct {
 	diskdb ethdb.KeyValueStore // Key-value store containing the base snapshot
-	triedb *trie.Database      // Trie node cache for reconstruction purposes
+	triedb *triedb.Database    // Trie node cache for reconstruction purposes
 	cache  *fastcache.Cache    // Cache to avoid hitting the disk for direct access
 
 	root  common.Hash // Root hash of the base snapshot
 	stale bool        // Signals that the layer became stale (state progressed)
 
-	genMarker  []byte                    // Marker for the state that's indexed during initial layer generation
-	genPending chan struct{}             // Notification channel when generation is done (test synchronicity)
-	genAbort   chan chan *generatorStats // Notification channel to abort generating the snapshot in this layer
+	genMarker  []byte        // Marker for the state that's indexed during initial layer generation
+	genPending chan struct{} // Notification channel when generation is done (test synchronicity)
+
+	// Generator lifecycle management:
+	// - [cancel] is closed to request termination (broadcast).
+	// - [done] is closed by the generator goroutine on exit.
+	cancel     chan struct{}
+	done       chan struct{}
+	cancelOnce sync.Once
+
+	genStats *generatorStats // Stats for snapshot generation (generation aborted/finished if non-nil)
 
 	lock sync.RWMutex
+}
+
+// Release releases underlying resources; specifically the fastcache requires
+// Reset() in order to not leak memory.
+// OBS: It does not invoke Close on the diskdb
+func (dl *diskLayer) Release() error {
+	// Stop any ongoing snapshot generation to prevent it from accessing
+	// the database after it's closed during shutdown
+	dl.stopGeneration()
+
+	if dl.cache != nil {
+		dl.cache.Reset()
+	}
+	return nil
 }
 
 // Root returns  root hash for which this snapshot was made.
@@ -63,9 +86,17 @@ func (dl *diskLayer) Stale() bool {
 	return dl.stale
 }
 
+// markStale sets the stale flag as true.
+func (dl *diskLayer) markStale() {
+	dl.lock.Lock()
+	defer dl.lock.Unlock()
+
+	dl.stale = true
+}
+
 // Account directly retrieves the account associated with a particular hash in
 // the snapshot slim data format.
-func (dl *diskLayer) Account(hash common.Hash) (*Account, error) {
+func (dl *diskLayer) Account(hash common.Hash) (*types.SlimAccount, error) {
 	data, err := dl.AccountRLP(hash)
 	if err != nil {
 		return nil, err
@@ -73,7 +104,7 @@ func (dl *diskLayer) Account(hash common.Hash) (*Account, error) {
 	if len(data) == 0 { // can be both nil and []byte{}
 		return nil, nil
 	}
-	account := new(Account)
+	account := new(types.SlimAccount)
 	if err := rlp.DecodeBytes(data, account); err != nil {
 		panic(err)
 	}
@@ -161,6 +192,31 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 // Update creates a new layer on top of the existing snapshot diff tree with
 // the specified data items. Note, the maps are retained by the method to avoid
 // copying everything.
-func (dl *diskLayer) Update(blockHash common.Hash, destructs map[common.Hash]struct{}, accounts map[common.Hash][]byte, storage map[common.Hash]map[common.Hash][]byte) *diffLayer {
-	return newDiffLayer(dl, blockHash, destructs, accounts, storage)
+func (dl *diskLayer) Update(blockHash common.Hash, accounts map[common.Hash][]byte, storage map[common.Hash]map[common.Hash][]byte) *diffLayer {
+	return newDiffLayer(dl, blockHash, accounts, storage)
+}
+
+// stopGeneration requests cancellation of any running snapshot generation and
+// blocks until the generator goroutine (if running) has fully terminated.
+//
+// Concurrency guarantees:
+//   - Thread-safe: May be called concurrently from multiple goroutines
+//   - Idempotent: Safe to call multiple times; subsequent calls have no effect
+//   - Blocking: Returns only after the generator goroutine (if any) has exited
+//   - Safe to call at any time, including when no generation is running
+//
+// After return, it is **guaranteed** that:
+//   - The generator goroutine has terminated
+//   - It is safe to proceed with cleanup operations (e.g. closing databases)
+func (dl *diskLayer) stopGeneration() {
+	cancel := dl.cancel
+	done := dl.done
+	if cancel == nil || done == nil {
+		return
+	}
+
+	dl.cancelOnce.Do(func() {
+		close(cancel)
+	})
+	<-done
 }

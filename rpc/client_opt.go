@@ -20,6 +20,7 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // ClientOption is a configuration option for the RPC client.
@@ -28,11 +29,20 @@ type ClientOption interface {
 }
 
 type clientConfig struct {
+	// HTTP settings
 	httpClient  *http.Client
 	httpHeaders http.Header
 	httpAuth    HTTPAuth
+	tmprop      propagation.TextMapPropagator
 
-	wsDialer *websocket.Dialer
+	// WebSocket options
+	wsDialer           *websocket.Dialer
+	wsMessageSizeLimit *int64 // wsMessageSizeLimit nil = default, 0 = no limit
+
+	// RPC handler options
+	idgen              func() ID
+	batchItemLimit     int
+	batchResponseLimit int
 }
 
 func (cfg *clientConfig) initHeaders() {
@@ -59,6 +69,14 @@ func WithWebsocketDialer(dialer websocket.Dialer) ClientOption {
 	})
 }
 
+// WithWebsocketMessageSizeLimit configures the websocket message size limit used by the RPC
+// client. Passing a limit of 0 means no limit.
+func WithWebsocketMessageSizeLimit(messageSizeLimit int64) ClientOption {
+	return optionFunc(func(cfg *clientConfig) {
+		cfg.wsMessageSizeLimit = &messageSizeLimit
+	})
+}
+
 // WithHeader configures HTTP headers set by the RPC client. Headers set using this option
 // will be used for both HTTP and WebSocket connections.
 func WithHeader(key, value string) ClientOption {
@@ -76,6 +94,22 @@ func WithHeaders(headers http.Header) ClientOption {
 		for k, vs := range headers {
 			cfg.httpHeaders[k] = vs
 		}
+	})
+}
+
+// WithTextMapPropagator configures OpenTelemetry trace propagation.
+// Note, by default, trace context is NOT propagated by rpc.Client.
+// To enable propagation via the `traceparent` header, you must explicitly
+// enable it by setting a propagator, e.g.
+//
+//	prop := propagation.TraceContext{}
+//	c, err := rpc.DialOptions(ctx, "http://", rpc.WithTextMapPropagator(prop))
+func WithTextMapPropagator(tmp propagation.TextMapPropagator) ClientOption {
+	if tmp == nil {
+		panic("nil TextMapPropagator configured")
+	}
+	return optionFunc(func(cfg *clientConfig) {
+		cfg.tmprop = tmp
 	})
 }
 
@@ -104,3 +138,25 @@ func WithHTTPAuth(a HTTPAuth) ClientOption {
 // Usually, HTTPAuth functions will call h.Set("authorization", "...") to add
 // auth information to the request.
 type HTTPAuth func(h http.Header) error
+
+// WithBatchItemLimit changes the maximum number of items allowed in batch requests.
+//
+// Note: this option applies when processing incoming batch requests. It does not affect
+// batch requests sent by the client.
+func WithBatchItemLimit(limit int) ClientOption {
+	return optionFunc(func(cfg *clientConfig) {
+		cfg.batchItemLimit = limit
+	})
+}
+
+// WithBatchResponseSizeLimit changes the maximum number of response bytes that can be
+// generated for batch requests. When this limit is reached, further calls in the batch
+// will not be processed.
+//
+// Note: this option applies when processing incoming batch requests. It does not affect
+// batch requests sent by the client.
+func WithBatchResponseSizeLimit(sizeLimit int) ClientOption {
+	return optionFunc(func(cfg *clientConfig) {
+		cfg.batchResponseLimit = sizeLimit
+	})
+}

@@ -16,7 +16,7 @@
 
 // This file contains the implementation for interacting with the Ledger hardware
 // wallets. The wire protocol spec can be found in the Ledger Blue GitHub repo:
-// https://raw.githubusercontent.com/LedgerHQ/blue-app-eth/master/doc/ethapp.asc
+// https://github.com/LedgerHQ/app-ethereum/blob/develop/doc/ethapp.adoc
 
 package usbwallet
 
@@ -59,6 +59,8 @@ const (
 	ledgerP1InitTransactionData     ledgerParam1 = 0x00 // First transaction data block for signing
 	ledgerP1ContTransactionData     ledgerParam1 = 0x80 // Subsequent transaction data block for signing
 	ledgerP2DiscardAddressChainCode ledgerParam2 = 0x00 // Do not return the chain code along with the address
+
+	ledgerEip155Size int = 3 // Size of the EIP-155 chain_id,r,s in unsigned transactions
 )
 
 // errLedgerReplyInvalidHeader is the error message returned by a Ledger data exchange
@@ -106,6 +108,16 @@ func (w *ledgerDriver) Status() (string, error) {
 // The method assumes that the state lock is held!
 func (w *ledgerDriver) offline() bool {
 	return w.version == [3]byte{0, 0, 0}
+}
+
+func ledgerVersionLessThan(version [3]byte, major, minor, patch byte) bool {
+	if version[0] != major {
+		return version[0] < major
+	}
+	if version[1] != minor {
+		return version[1] < minor
+	}
+	return version[2] < patch
 }
 
 // Open implements usbwallet.driver, attempting to initialize the connection to the
@@ -164,7 +176,19 @@ func (w *ledgerDriver) SignTx(path accounts.DerivationPath, tx *types.Transactio
 		return common.Address{}, nil, accounts.ErrWalletClosed
 	}
 	// Ensure the wallet is capable of signing the given transaction
-	if chainID != nil && w.version[0] <= 1 && w.version[1] <= 0 && w.version[2] <= 2 {
+	switch tx.Type() {
+	case types.AccessListTxType, types.DynamicFeeTxType:
+		if ledgerVersionLessThan(w.version, 1, 9, 0) {
+			//lint:ignore ST1005 brand name displayed on the console
+			return common.Address{}, nil, fmt.Errorf("Ledger version >= 1.9.0 required for EIP-2930/EIP-1559 signing (found version v%d.%d.%d)", w.version[0], w.version[1], w.version[2])
+		}
+	case types.SetCodeTxType:
+		if ledgerVersionLessThan(w.version, 1, 17, 0) {
+			//lint:ignore ST1005 brand name displayed on the console
+			return common.Address{}, nil, fmt.Errorf("Ledger version >= 1.17.0 required for EIP-7702 signing (found version v%d.%d.%d)", w.version[0], w.version[1], w.version[2])
+		}
+	}
+	if chainID != nil && ledgerVersionLessThan(w.version, 1, 0, 3) {
 		//lint:ignore ST1005 brand name displayed on the console
 		return common.Address{}, nil, fmt.Errorf("Ledger v%d.%d.%d doesn't support signing this transaction, please update to v1.0.3 at least", w.version[0], w.version[1], w.version[2])
 	}
@@ -182,7 +206,7 @@ func (w *ledgerDriver) SignTypedMessage(path accounts.DerivationPath, domainHash
 		return nil, accounts.ErrWalletClosed
 	}
 	// Ensure the wallet is capable of signing the given transaction
-	if w.version[0] < 1 && w.version[1] < 5 {
+	if ledgerVersionLessThan(w.version, 1, 5, 0) {
 		//lint:ignore ST1005 brand name displayed on the console
 		return nil, fmt.Errorf("Ledger version >= 1.5.0 required for EIP-712 signing (found version v%d.%d.%d)", w.version[0], w.version[1], w.version[2])
 	}
@@ -277,7 +301,7 @@ func (w *ledgerDriver) ledgerDerive(derivationPath []uint32) (common.Address, er
 	}
 	hexstr := reply[1 : 1+int(reply[0])]
 
-	// Decode the hex sting into an Ethereum address and return
+	// Decode the hex string into an Ethereum address and return
 	var address common.Address
 	if _, err = hex.Decode(address[:], hexstr); err != nil {
 		return common.Address{}, err
@@ -332,12 +356,41 @@ func (w *ledgerDriver) ledgerSign(derivationPath []uint32, tx *types.Transaction
 		err   error
 	)
 	if chainID == nil {
-		if txrlp, err = rlp.EncodeToBytes([]interface{}{tx.Nonce(), tx.GasPrice(), tx.Gas(), tx.To(), tx.Value(), tx.Data()}); err != nil {
+		if txrlp, err = rlp.EncodeToBytes([]any{tx.Nonce(), tx.GasPrice(), tx.Gas(), tx.To(), tx.Value(), tx.Data()}); err != nil {
 			return common.Address{}, nil, err
 		}
 	} else {
-		if txrlp, err = rlp.EncodeToBytes([]interface{}{tx.Nonce(), tx.GasPrice(), tx.Gas(), tx.To(), tx.Value(), tx.Data(), chainID, big.NewInt(0), big.NewInt(0)}); err != nil {
-			return common.Address{}, nil, err
+		switch tx.Type() {
+		case types.SetCodeTxType:
+			if txrlp, err = rlp.EncodeToBytes([]any{chainID, tx.Nonce(), tx.GasTipCap(), tx.GasFeeCap(), tx.Gas(), tx.To(), tx.Value(), tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations()}); err != nil {
+				return common.Address{}, nil, err
+			}
+			// append type to transaction
+			txrlp = append([]byte{tx.Type()}, txrlp...)
+		case types.BlobTxType:
+			if txrlp, err = rlp.EncodeToBytes([]any{chainID, tx.Nonce(), tx.GasTipCap(), tx.GasFeeCap(), tx.Gas(), tx.To(), tx.Value(), tx.Data(), tx.AccessList(), tx.BlobGasFeeCap(), tx.BlobHashes()}); err != nil {
+				return common.Address{}, nil, err
+			}
+			// append type to transaction
+			txrlp = append([]byte{tx.Type()}, txrlp...)
+		case types.DynamicFeeTxType:
+			if txrlp, err = rlp.EncodeToBytes([]any{chainID, tx.Nonce(), tx.GasTipCap(), tx.GasFeeCap(), tx.Gas(), tx.To(), tx.Value(), tx.Data(), tx.AccessList()}); err != nil {
+				return common.Address{}, nil, err
+			}
+			// append type to transaction
+			txrlp = append([]byte{tx.Type()}, txrlp...)
+		case types.AccessListTxType:
+			if txrlp, err = rlp.EncodeToBytes([]any{chainID, tx.Nonce(), tx.GasPrice(), tx.Gas(), tx.To(), tx.Value(), tx.Data(), tx.AccessList()}); err != nil {
+				return common.Address{}, nil, err
+			}
+			// append type to transaction
+			txrlp = append([]byte{tx.Type()}, txrlp...)
+		case types.LegacyTxType:
+			if txrlp, err = rlp.EncodeToBytes([]any{tx.Nonce(), tx.GasPrice(), tx.Gas(), tx.To(), tx.Value(), tx.Data(), chainID, big.NewInt(0), big.NewInt(0)}); err != nil {
+				return common.Address{}, nil, err
+			}
+		default:
+			return common.Address{}, nil, fmt.Errorf("unsupported transaction type: %d", tx.Type())
 		}
 	}
 	payload := append(path, txrlp...)
@@ -347,9 +400,17 @@ func (w *ledgerDriver) ledgerSign(derivationPath []uint32, tx *types.Transaction
 		op    = ledgerP1InitTransactionData
 		reply []byte
 	)
+
+	// Chunk size selection to mitigate an underlying RLP deserialization issue on the ledger app.
+	// https://github.com/LedgerHQ/app-ethereum/issues/409
+	chunk := 255
+	if tx.Type() == types.LegacyTxType {
+		for ; len(payload)%chunk <= ledgerEip155Size; chunk-- {
+		}
+	}
+
 	for len(payload) > 0 {
 		// Calculate the size of the next data chunk
-		chunk := 255
 		if chunk > len(payload) {
 			chunk = len(payload)
 		}
@@ -373,8 +434,11 @@ func (w *ledgerDriver) ledgerSign(derivationPath []uint32, tx *types.Transaction
 	if chainID == nil {
 		signer = new(types.HomesteadSigner)
 	} else {
-		signer = types.NewEIP155Signer(chainID)
-		signature[64] -= byte(chainID.Uint64()*2 + 35)
+		signer = types.LatestSignerForChainID(chainID)
+		// For non-legacy transactions, V is 0 or 1, no need to subtract here.
+		if tx.Type() == types.LegacyTxType {
+			signature[64] -= byte(chainID.Uint64()*2 + 35)
+		}
 	}
 	signed, err := tx.WithSignature(signer, signature)
 	if err != nil {

@@ -32,14 +32,17 @@ var ShowDeprecated = &cli.Command{
 }
 
 var DeprecatedFlags = []cli.Flag{
-	NoUSBFlag,
+	StateSizeTrackingFlag,
 }
 
 var (
-	// (Deprecated May 2020, shown in aliased flags section)
-	NoUSBFlag = &cli.BoolFlag{
-		Name:     "nousb",
-		Usage:    "Disables monitoring for and managing USB hardware wallets (deprecated)",
+	// Deprecated August 2026, state size tracking was removed along with the
+	// debug_stateSize endpoint it fed. Kept registered so that nodes carrying
+	// the flag in their startup scripts do not fail to boot.
+	StateSizeTrackingFlag = &cli.BoolFlag{
+		Name:     "state.size-tracking",
+		Hidden:   true,
+		Usage:    "Enable state size tracking (deprecated)",
 		Category: flags.DeprecatedCategory,
 	}
 )
